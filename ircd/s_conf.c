@@ -80,6 +80,9 @@ struct wline*      GlobalWebircList;
 /** Current line number in scanner input. */
 int lineno;
 
+/** Flag for whether to perform ident lookups. */
+int DoIdentLookups;
+
 /** Configuration information for #me. */
 struct LocalConf   localConf;
 /** Global list of connection rules. */
@@ -371,8 +374,6 @@ enum AuthorizationCheckResult attach_iline(struct Client* cptr)
       continue;
     if (IPcheck_nr(cptr) > aconf->maximum)
       return ACR_TOO_MANY_FROM_IP;
-    if (aconf->username)
-      SetFlag(cptr, FLAG_DOID);
     return attach_conf(cptr, aconf);
   }
   return ACR_NO_AUTHORIZATION;
@@ -989,6 +990,7 @@ int rehash(struct Client *cptr, int sig)
   auth_mark_closing();
   webirc_mark_stale();
   close_mappings();
+  DoIdentLookups = 0;
 
   read_configuration_file();
 
@@ -1058,8 +1060,7 @@ int init_conf(void)
     /*
      * make sure we're sane to start if the config
      * file read didn't get everything we need.
-     * XXX - should any of these abort the server?
-     * TODO: add warning messages
+     * ircd_parser.y now has parse_error() for serious problems.
      */
     if (0 == localConf.name || 0 == localConf.numeric)
       return 0;

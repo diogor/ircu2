@@ -60,6 +60,7 @@
 #include "s_conf.h"
 #include "s_debug.h"
 #include "s_misc.h"
+#include "s_stats.h"
 #include "s_user.h"
 #include "send.h"
 
@@ -158,6 +159,7 @@ enum IAuthFlag
   IAUTH_TIMEOUT,                        /**< Refuse new connections if IAuth is behind. */
   IAUTH_EXTRAWAIT,                      /**< Give IAuth extra time to answer. */
   IAUTH_UNDERNET,                       /**< Enable Undernet extensions. */
+  IAUTH_STATS2,                         /**< Support "? stats2" request. */
   IAUTH_LAST_FLAG                       /**< total number of flags */
 };
 /** Declare a bitset structure indexed by IAuthFlag. */
@@ -207,6 +209,10 @@ struct IAuth {
 static struct IAuth *iauth;
 /** Freelist of AuthRequest structures. */
 static struct AuthRequest *auth_freelist;
+/** Clients currently receiving IAuth statistics. */
+static struct SLink *iauth_stats_clients;
+/** Clients queued to get IAuth statistics. */
+static struct SLink *iauth_stats_queued;
 
 static void iauth_sock_callback(struct Event *ev);
 static void iauth_stderr_callback(struct Event *ev);
@@ -442,7 +448,7 @@ static int check_auth_finished(struct AuthRequest *auth, int bitclr)
     {
       clean_username(user->username, cli_username(sptr));
     }
-    else if (HasFlag(sptr, FLAG_DOID))
+    else if (DoIdentLookups)
     {
       /* Prepend ~ to user->username. */
       char *s = user->username;
@@ -1157,7 +1163,8 @@ void start_auth(struct Client* client)
     start_dns_query(auth);
 
     /* Try to start ident lookup. */
-    start_auth_query(auth);
+    if (DoIdentLookups)
+      start_auth_query(auth);
   }
 
   /* Add client to GlobalClientList. */
@@ -1320,8 +1327,6 @@ int auth_spoof_user(struct AuthRequest *auth, const char *username, const char *
   if (username) {
     ircd_strncpy(cli_username(sptr), username, USERLEN);
     SetGotId(sptr);
-  } else {
-    SetFlag(sptr, FLAG_DOID);
   }
 
   start_iauth_query(auth);
@@ -1653,6 +1658,7 @@ static int iauth_cmd_debuglevel(struct IAuth *iauth, struct Client *cli,
  * \li T IAUTH_TIMEOUT
  * \li W IAUTH_EXTRAWAIT
  * \li U IAUTH_UNDERNET
+ * \li S IAUTH_STATS2
  *
  * @param[in] iauth Active IAuth session.
  * @param[in] cli Client referenced by command.
@@ -1678,6 +1684,7 @@ static int iauth_cmd_policy(struct IAuth *iauth, struct Client *cli,
     case 'T': IAuthSet(iauth, IAUTH_TIMEOUT); break;
     case 'W': IAuthSet(iauth, IAUTH_EXTRAWAIT); break;
     case 'U': IAuthSet(iauth, IAUTH_UNDERNET); break;
+    case 'S': IAuthSet(iauth, IAUTH_STATS2); break;
     }
 
   /* Optionally notify operators. */
@@ -1703,41 +1710,31 @@ static int iauth_cmd_version(struct IAuth *iauth, struct Client *cli,
   return 0;
 }
 
-/** Paste a parameter list together into a single string.
+/** Paste a parameter list together into a single (static) string.
  * @param[in] parc Number of parameters.
  * @param[in] params Parameter list to paste together.
  * @return Pasted parameter list.
  */
 static char *paste_params(int parc, char **params)
 {
-  char *str, *tmp;
-  int len = 0, lengths[MAXPARA], i;
+  static char buf[BUFSIZE+1];
+  int len, i, j;
 
   /* Compute the length... */
-  for (i = 0; i < parc; i++)
-    len += lengths[i] = strlen(params[i]);
-
-  /* Allocate memory, accounting for string lengths, spaces (parc - 1), a
-   * sentinel, and the trailing \0
-   */
-  str = MyMalloc(len + parc + 1);
-
-  /* Build the pasted string */
-  for (tmp = str, i = 0; i < parc; i++) {
-    if (i) /* add space separator... */
-      *(tmp++) = ' ';
-    if (i == parc - 1) /* add colon sentinel */
-      *(tmp++) = ':';
-
-    /* Copy string component... */
-    memcpy(tmp, params[i], lengths[i]);
-    tmp += lengths[i]; /* move to end of string */
+  for (i = len = 0; i < parc; i++) {
+    char *p = params[i];
+    if (i && (len < BUFSIZE)) /* add space separator... */
+      buf[len++] = ' ';
+    if ((i == parc - 1) && (len < BUFSIZE)) /* add colon sentinel */
+      buf[len++] = ':';
+    for (j = 0; (p[j] != '\0') && (len < BUFSIZE); ++j) /* copy arg */
+      buf[len++] = p[j];
   }
 
-  /* terminate the string... */
-  *tmp = '\0';
+  /* terminate the string */
+  buf[len] = '\0';
 
-  return str; /* return the pasted string */
+  return buf;
 }
 
 /** Clear cached iauth configuration information.
@@ -1774,15 +1771,13 @@ static int iauth_cmd_newconfig(struct IAuth *iauth, struct Client *cli,
 static int iauth_cmd_config(struct IAuth *iauth, struct Client *cli,
 			    int parc, char **params)
 {
-  struct SLink *node;
+  struct SLink *node, **pptr;
+  char *line;
 
-  if (iauth->i_config) {
-    for (node = iauth->i_config; node->next; node = node->next) ;
-    node = node->next = make_link();
-  } else {
-    node = iauth->i_config = make_link();
-  }
-  node->value.cp = paste_params(parc, params);
+  for (pptr = &iauth->i_config; *pptr; pptr = &((*pptr)->next)) ;
+  node = *pptr = make_link();
+  line = paste_params(parc, params);
+  DupString(node->value.cp, line);
   node->next = 0; /* must be explicitly cleared */
   return 0;
 }
@@ -1800,14 +1795,34 @@ static int iauth_cmd_newstats(struct IAuth *iauth, struct Client *cli,
   struct SLink *head;
   struct SLink *next;
 
-  head = iauth->i_stats;
-  iauth->i_stats = NULL;
-  for (; head; head = next) {
-    next = head->next;
-    MyFree(head->value.cp);
-    free_link(head);
+  if (iauth_stats_clients)
+  {
+    for (head = iauth_stats_clients; head; head = next)
+    {
+      next = head->next;
+      send_reply(head->value.cptr, RPL_ENDOFSTATS, "iauthstats");
+      free_link(head);
+    }
+
+    iauth_stats_clients = iauth_stats_queued;
+    iauth_stats_queued = NULL;
+    if (iauth_stats_clients)
+    {
+      sendto_iauth(NULL, "? stats2");
+    }
   }
-  sendto_opmask_butone(NULL, SNO_AUTH, "New iauth statistics.");
+  else
+  {
+    head = iauth->i_stats;
+    iauth->i_stats = NULL;
+    for (; head; head = next) {
+      next = head->next;
+      MyFree(head->value.cp);
+      free_link(head);
+    }
+    sendto_opmask_butone(NULL, SNO_AUTH, "New iauth statistics.");
+  }
+
   return 0;
 }
 
@@ -1821,15 +1836,26 @@ static int iauth_cmd_newstats(struct IAuth *iauth, struct Client *cli,
 static int iauth_cmd_stats(struct IAuth *iauth, struct Client *cli,
 			   int parc, char **params)
 {
-  struct SLink *node;
-  if (iauth->i_stats) {
-    for (node = iauth->i_stats; node->next; node = node->next) ;
-    node = node->next = make_link();
-  } else {
-    node = iauth->i_stats = make_link();
+  struct SLink *node, **pptr;
+  char *line;
+
+  line = paste_params(parc, params);
+  if (iauth_stats_clients)
+  {
+    for (node = iauth_stats_clients; node; node = node->next)
+    {
+      struct Client *cptr = node->value.cptr;
+      send_reply(cptr, SND_EXPLICIT | RPL_STATSDEBUG, ":%s", line);
+    }
   }
-  node->value.cp = paste_params(parc, params);
-  node->next = 0; /* must be explicitly cleared */
+  else
+  {
+    for (pptr = &iauth->i_stats; *pptr; pptr = &((*pptr)->next)) ;
+    node = *pptr = make_link();
+    DupString(node->value.cp, line);
+    node->next = 0; /* must be explicitly cleared */
+  }
+
   return 0;
 }
 
@@ -2058,7 +2084,6 @@ static int iauth_cmd_done_client(struct IAuth *iauth, struct Client *cli,
       acr = attach_conf(cli, aconf);
       switch (acr) {
       case ACR_OK:
-        /* There should maybe be some way to set FLAG_DOID here.. */
       case ACR_TOO_MANY_IN_CLASS:
         /* Take iauth's word for it. */
         break;
@@ -2343,17 +2368,26 @@ static void iauth_read(struct IAuth *iauth)
   memcpy(readbuf, iauth->i_buffer, length);
   if (IO_SUCCESS != os_recv_nonb(s_fd(i_socket(iauth)),
 				 readbuf + length,
-				 sizeof(readbuf) - length - 1,
+				 sizeof(readbuf) - length,
 				 &count))
     return;
   length += count;
-  readbuf[length] = '\0';
 
   /* Parse each complete line. */
-  for (sol = readbuf; (eol = strchr(sol, '\n')) != NULL; sol = eol + 1) {
-    *eol = '\0';
-    if (*(eol - 1) == '\r') /* take out carriage returns, too... */
-      *(eol - 1) = '\0';
+  for (sol = readbuf; 1; sol = eol + 1) {
+    for (eol = sol; eol != readbuf+length && !IsEol(*eol) && *eol != '\0'; eol++) {}
+    if (eol == readbuf+length) {
+      break;
+    } else if (*eol == '\n') {
+      *eol = '\0';
+    } else if (*eol == '\r' && eol[1] == '\n') {
+      *eol = '\0';
+      *++eol = '\0';
+    } else {
+      log_write(LS_IAUTH, L_WARNING, 0,
+        "Illegal control character from IAuth: \\x%02x", (int)*eol);
+      continue;
+    }
 
     /* If spammy debug, send the message to opers. */
     if (i_debug(iauth) > 1)
@@ -2364,7 +2398,7 @@ static void iauth_read(struct IAuth *iauth)
   }
 
   /* Put unused data back into connection's buffer. */
-  iauth->i_count = strlen(sol);
+  iauth->i_count = readbuf + length - sol;
   if (iauth->i_count > BUFSIZE)
     iauth->i_count = BUFSIZE;
   memcpy(iauth->i_buffer, sol, iauth->i_count);
@@ -2483,13 +2517,22 @@ static void iauth_stderr_callback(struct Event *ev)
  */
 void report_iauth_conf(struct Client *cptr, const struct StatDesc *sd, char *param)
 {
-    struct SLink *link;
+  struct SLink *link;
 
-    if (iauth) for (link = iauth->i_config; link; link = link->next)
-    {
-        send_reply(cptr, SND_EXPLICIT | RPL_STATSDEBUG, ":%s",
-                   link->value.cp);
-    }
+  if (!iauth)
+    return;
+
+  send_reply(cptr, SND_EXPLICIT | RPL_STATSDEBUG, " :%s",
+    iauth->i_version ? iauth->i_version : "IAuth did not report a version");
+  for (link = iauth->i_config; link; link = link->next)
+  {
+    send_reply(cptr, SND_EXPLICIT | RPL_STATSDEBUG, ":%s", link->value.cp);
+  }
+
+  if (param && !strcmp(param, "get"))
+  {
+    sendto_iauth(NULL, "? config");
+  }
 }
 
 /** Report active iauth's statistics to \a cptr.
@@ -2497,13 +2540,63 @@ void report_iauth_conf(struct Client *cptr, const struct StatDesc *sd, char *par
  * @param[in] sd Stats descriptor for request.
  * @param[in] param Extra parameter from user (may be NULL).
  */
- void report_iauth_stats(struct Client *cptr, const struct StatDesc *sd, char *param)
+void report_iauth_stats(struct Client *cptr, const struct StatDesc *sd, char *param)
 {
+  struct SLink *link;
+
+  if (!iauth)
+    return;
+
+  if (IAuthHas(iauth, IAUTH_STATS2))
+  {
     struct SLink *link;
 
-    if (iauth) for (link = iauth->i_stats; link; link = link->next)
+    link = make_link();
+    link->value.cptr = cptr;
+    if (iauth_stats_clients)
     {
-        send_reply(cptr, SND_EXPLICIT | RPL_STATSDEBUG, ":%s",
-                   link->value.cp);
+      link->next = iauth_stats_queued;
+      iauth_stats_queued = link;
     }
+    else
+    {
+      iauth_stats_clients = link;
+      sendto_iauth(NULL, "? stats2");
+    }
+  }
+  else
+  {
+    for (link = iauth->i_stats; link; link = link->next)
+    {
+      send_reply(cptr, SND_EXPLICIT | RPL_STATSDEBUG, ":%s", link->value.cp);
+    }
+    send_reply(cptr, RPL_ENDOFSTATS, sd->sd_name);
+
+    if (param && !strcmp(param, "get") && !IAuthHas(iauth, IAUTH_STATS2))
+    {
+        sendto_iauth(NULL, "? stats");
+    }
+  }
+}
+
+static void remove_client_from_slist(struct Client *cptr, struct SLink **pptr)
+{
+  for (; *pptr != NULL; pptr = &((*pptr)->next))
+  {
+    if ((*pptr)->value.cptr == cptr)
+    {
+      struct SLink *link = *pptr;
+      *pptr = link->next;
+      free_link(link);
+    }
+  }
+}
+
+/** Cancel a client's request for IAuth statistics.
+ * @param[in] cptr Client to cancel request for.
+ */
+void auth_cancel_iauth_stats(struct Client *cptr)
+{
+  remove_client_from_slist(cptr, &iauth_stats_clients);
+  remove_client_from_slist(cptr, &iauth_stats_queued);
 }
